@@ -1,0 +1,48 @@
+name: Render 10 shorts in parallel
+on:
+  workflow_dispatch:
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      manifest: ${{ steps.read.outputs.manifest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip render repo
+        run: |
+          sudo apt-get update -qq && (sudo apt-get install -y -qq p7zip-full || sudo apt-get install -y -qq 7zip)
+          7z x -p"${{ secrets.RENDER_ZIP_PASSWORD }}" stick3d-render-repo.zip -y
+      - name: Read shorts manifest
+        id: read
+        run: echo "manifest=$(jq -c . shorts-manifest.json)" >> "$GITHUB_OUTPUT"
+  render-short:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJson(needs.setup.outputs.manifest) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip render repo
+        run: |
+          sudo apt-get update -qq && (sudo apt-get install -y -qq p7zip-full || sudo apt-get install -y -qq 7zip)
+          7z x -p"${{ secrets.RENDER_ZIP_PASSWORD }}" stick3d-render-repo.zip -y
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install engine deps
+        working-directory: engine
+        run: npm install
+      - name: Render ${{ matrix.entry.composition }}
+        working-directory: engine
+        run: |
+          END=$(( ${{ matrix.entry.frames }} - 1 ))
+          npx remotion render src/index.ts ${{ matrix.entry.composition }} ${{ matrix.entry.output }} --frames=0-$END --concurrency=2 --timeout=300000
+      - name: Artifact name
+        id: name
+        run: echo "name=$(basename ${{ matrix.entry.output }} .mp4)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: engine/${{ matrix.entry.output }}
