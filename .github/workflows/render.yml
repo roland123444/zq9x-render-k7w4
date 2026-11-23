@@ -1,0 +1,43 @@
+name: Render Stick3D in parallel
+on:
+  workflow_dispatch:
+    inputs:
+      composition:
+        description: "Remotion composition id"
+        default: "NvidiaStory"
+      total_frames:
+        description: "Total frames in composition"
+        default: "11763"
+      frames_per_part:
+        description: "Frames per part"
+        default: "1177"
+jobs:
+  render-part:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Unzip project
+        run: |
+          sudo apt-get update -qq && (sudo apt-get install -y -qq p7zip-full || sudo apt-get install -y -qq 7zip)
+          7z x -p"${{ secrets.RENDER_ZIP_PASSWORD }}" stick3d-render-repo.zip -y
+      - name: Install engine deps
+        working-directory: engine
+        run: npm install
+      - name: Render part ${{ matrix.part }}
+        working-directory: engine
+        run: |
+          START=$(( ${{ matrix.part }} * ${{ inputs.frames_per_part }} ))
+          END=$(( START + ${{ inputs.frames_per_part }} - 1 ))
+          if [ $END -ge ${{ inputs.total_frames }} ]; then END=$(( ${{ inputs.total_frames }} - 1 )); fi
+          npx remotion render src/index.ts ${{ inputs.composition }} part-${{ matrix.part }}.mp4 --frames=$START-$END --concurrency=2 --timeout=300000
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.part }}
+          path: engine/part-${{ matrix.part }}.mp4
