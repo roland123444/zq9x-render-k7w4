@@ -33,7 +33,7 @@ jobs:
           node-version: 20
       - name: Install engine deps
         working-directory: engine
-        run: npm install
+        run: npm install --ignore-scripts
       - name: Render ${{ matrix.entry.composition }}
         working-directory: engine
         run: |
