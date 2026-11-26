@@ -1,0 +1,55 @@
+name: Render stills in parallel
+# Check-round stills render on GitHub in parallel (one job per frame) — the permanent
+# still-check loop (user, 2026-11-26). Local half-res stills are the fallback only.
+# Pack + upload per round stays: the engine zip (stick3d-render-repo.zip, AES-256 7z)
+# must be in the repo root before dispatching, and this file in .github/workflows/.
+on:
+  workflow_dispatch:
+    inputs:
+      composition:
+        description: "Remotion composition id (e.g. WheelerShort)"
+        default: "WheelerShort"
+      frames:
+        description: "Comma-separated frame numbers, up to ~20 (e.g. 352,621,659,710,936)"
+        default: "352"
+      scale:
+        description: "Output scale: 0.5 = 540x960 check round, 1 = full-res 1080x1920 final pass"
+        default: "0.5"
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      frames: ${{ steps.parse.outputs.frames }}
+    steps:
+      - id: parse
+        run: |
+          FRAMES=$(echo '${{ inputs.frames }}' | python3 -c "import sys,json; print(json.dumps([int(x) for x in sys.stdin.read().strip().split(',') if x.strip()]))")
+          echo "frames=$FRAMES" >> "$GITHUB_OUTPUT"
+  render-still:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        frame: ${{ fromJson(needs.setup.outputs.frames) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Unzip project
+        run: |
+          sudo apt-get update -qq && (sudo apt-get install -y -qq p7zip-full || sudo apt-get install -y -qq 7zip)
+          7z x -p"${{ secrets.RENDER_ZIP_PASSWORD }}" stick3d-render-repo.zip -y
+      - name: Install engine deps
+        working-directory: engine
+        run: npm install --ignore-scripts
+      - name: Render still frame ${{ matrix.frame }}
+        working-directory: engine
+        run: |
+          npx remotion still src/index.ts ${{ inputs.composition }} still-${{ matrix.frame }}.png --frame=${{ matrix.frame }} --image-format=png --scale=${{ inputs.scale }} --timeout=240000
+          [ -f still-${{ matrix.frame }}.png ] || cp out/${{ inputs.composition }}.png still-${{ matrix.frame }}.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: still-${{ matrix.frame }}
+          path: engine/still-${{ matrix.frame }}.png
