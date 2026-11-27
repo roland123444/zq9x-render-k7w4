@@ -1,0 +1,236 @@
+# Faster Short Pipeline — render-shots.yml (NEW workflow)
+#
+# Matrix over SHOTS, not arbitrary frame splits. Each shot is its own
+# Remotion composition and renders in its own job to its own MP4
+# artifact named `shot-<id>`; a `join-shots` job then concats the shot
+# MP4s in shot order and RE-TIMES to true 30fps (`setpts=N/(30*TB)`,
+# CRF-30 re-encode, `-an` to drop the shots' silent AAC track) into ONE
+# `final-video` artifact. The re-time is mandatory: plain `-c copy`
+# concat plays slow (~27fps) because the shot files carry stretched
+# container durations (AGENTS.md) — parent decision 2026-11-27, applied
+# here before first upload.
+#
+# COMPOSITION NAMING CONVENTION (the per-shot compositions are being
+# built by a sibling agent; this workflow assumes them):
+#   composition input = the short's prefix, e.g. "Holloway"
+#   shot id          = zero-padded two digits, e.g. "01"
+#   composition id   = <prefix>Shot<id>, e.g. "HollowayShot01"
+# Each shot composition renders its own frame range starting at 0, so
+# the shot's `frames` value is its own length (not a global offset).
+#
+# Inputs:
+#   composition — per-shot composition id PREFIX (see above).
+#   shots       — either a JSON list, e.g.
+#                   [{"id":"01","frames":120},{"id":"02","frames":90}]
+#                 or a comma list of id:frames pairs, e.g. "01:120,02:90".
+#                 Shot ids must be unique; every frames value > 0.
+#   scale       — 1 = full-res 1080x1920 (default), 0.5 = 540x960 check.
+#
+# Hard rules kept (same as render.yml):
+#   - $0 only, 1080p, CRF-30, under 100MB. Engine / Bridge.tsx /
+#     video code untouched — workflows only.
+#   - Engine travels as the AES-256 encrypted 7z
+#     stick3d-render-repo.zip, extracted with p7zip using the
+#     RENDER_ZIP_PASSWORD secret. The Unzip step is identical to the
+#     current workflows — do not "improve" it.
+#   - Same cache steps as the new render.yml (node_modules, Remotion
+#     browser, bundle), each with a restore-key + normal-install
+#     fallback: a cache miss never fails a job.
+#   - Shot artifacts retention-days: 1 (intermediates); the joined
+#     final-video is the keeper (retention-days: 7).
+#   - render-shorts.yml is NOT touched by this file and keeps its own
+#     purpose (one job per manifest entry, no part-splitting).
+
+name: Render shots in parallel
+on:
+  workflow_dispatch:
+    inputs:
+      composition:
+        description: "Per-shot composition id PREFIX (each shot renders as <prefix>Shot<NN>, e.g. HollowayShot01)"
+        default: "Holloway"
+      shots:
+        description: 'JSON list [{"id":"01","frames":120},...] or comma list "01:120,02:90"'
+        default: '[{"id":"01","frames":120}]'
+      scale:
+        description: "Output scale: 1 = full-res 1080x1920, 0.5 = 540x960 check"
+        default: "1"
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      shots: ${{ steps.parse.outputs.shots }}
+      total_frames: ${{ steps.parse.outputs.total_frames }}
+    steps:
+      - id: parse
+        run: |
+          python3 - <<'PY'
+          import json, os
+          raw = """${{ inputs.shots }}""".strip()
+          if raw.startswith('['):
+              shots = json.loads(raw)
+              shots = [{"id": str(s["id"]), "frames": int(s["frames"])} for s in shots]
+          else:
+              shots = []
+              for pair in raw.split(','):
+                  pair = pair.strip()
+                  if not pair:
+                      continue
+                  sid, frames = pair.split(':', 1)
+                  shots.append({"id": sid.strip(), "frames": int(frames.strip())})
+          assert shots, "no shots parsed from input"
+          ids = [s["id"] for s in shots]
+          assert len(ids) == len(set(ids)), f"duplicate shot ids: {ids}"
+          assert all(s["frames"] > 0 for s in shots), "every shot needs frames > 0"
+          total = sum(s["frames"] for s in shots)
+          print(f"Parsed {len(shots)} shots, {total} frames total: {shots}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"shots={json.dumps(shots)}\n")
+              f.write(f"total_frames={total}\n")
+          PY
+
+  render-shot:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shot: ${{ fromJson(needs.setup.outputs.shots) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # IDENTICAL to the current workflows — keep exactly as-is.
+      - name: Unzip project
+        run: |
+          sudo apt-get update -qq && (sudo apt-get install -y -qq p7zip-full || sudo apt-get install -y -qq 7zip)
+          7z x -p"${{ secrets.RENDER_ZIP_PASSWORD }}" stick3d-render-repo.zip -y
+      # --- Cache 1: node_modules (same as new render.yml) -------------
+      - name: Cache node_modules
+        id: cache-node
+        uses: actions/cache@v4
+        with:
+          path: engine/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('engine/package-lock.json', 'engine/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      - name: Install engine deps
+        if: steps.cache-node.outputs.cache-hit != 'true'
+        working-directory: engine
+        run: npm install --ignore-scripts
+      # --- Cache 2: Remotion / Chrome browser download ---------------
+      - name: Cache Remotion browser
+        id: cache-browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/remotion
+          key: ${{ runner.os }}-remotion-browser-${{ hashFiles('engine/package-lock.json', 'engine/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-remotion-browser-
+      # Non-fatal on purpose: if this Remotion version has no `browser
+      # ensure` subcommand, the render step below auto-downloads the
+      # browser anyway. Never let this step break a render.
+      - name: Ensure Remotion browser
+        if: steps.cache-browser.outputs.cache-hit != 'true'
+        working-directory: engine
+        continue-on-error: true
+        run: npx remotion browser ensure
+      # --- Cache 3: webpack bundle ------------------------------------
+      - name: Cache bundle
+        id: cache-bundle
+        uses: actions/cache@v4
+        with:
+          path: engine/bundle
+          key: ${{ runner.os }}-bundle-${{ hashFiles('engine/src/**', 'engine/package.json', 'engine/package-lock.json', 'engine/remotion.config.ts') }}
+          restore-keys: |
+            ${{ runner.os }}-bundle-
+      # Non-fatal: on failure delete any partial bundle so a broken dir
+      # is never cached; the render step falls back to src/index.ts.
+      - name: Bundle project
+        if: steps.cache-bundle.outputs.cache-hit != 'true'
+        working-directory: engine
+        continue-on-error: true
+        run: npx remotion bundle src/index.ts bundle || rm -rf bundle
+      - name: Render shot ${{ matrix.shot.id }}
+        working-directory: engine
+        run: |
+          if [ -d bundle ]; then ENTRY=bundle; else ENTRY=src/index.ts; fi
+          END=$(( ${{ matrix.shot.frames }} - 1 ))
+          npx remotion render "$ENTRY" ${{ inputs.composition }}Shot${{ matrix.shot.id }} shot-${{ matrix.shot.id }}.mp4 --frames=0-$END --scale=${{ inputs.scale }} --concurrency=2 --timeout=300000
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shot-${{ matrix.shot.id }}
+          path: engine/shot-${{ matrix.shot.id }}.mp4
+          retention-days: 1
+          if-no-files-found: error
+
+  join-shots:
+    name: Join shots into final video
+    needs: [setup, render-shot]
+    # Run even if a shot failed, so the failure is LOUD: the download
+    # loop below exits 1 naming the missing shot, instead of the join
+    # silently skipping.
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download shot artifacts in order
+        run: |
+          set -euo pipefail
+          mkdir -p shots
+          IDS=$(echo '${{ needs.setup.outputs.shots }}' | python3 -c "import sys,json; print(' '.join(str(s['id']) for s in json.load(sys.stdin)))")
+          echo "Shot order: $IDS"
+          for id in $IDS; do
+            echo "Downloading shot-$id ..."
+            gh run download "${{ github.run_id }}" --repo "${{ github.repository }}" -n "shot-$id" -D "shots/shot-$id"
+            f="shots/shot-$id/shot-$id.mp4"
+            [ -s "$f" ] || { echo "ERROR: shot-$id artifact is missing or empty — join cannot proceed"; exit 1; }
+          done
+          echo "All shots present."
+      - name: Join shots (re-time to true 30fps + CRF-30) and verify frame count
+        run: |
+          set -euo pipefail
+          IDS=$(echo '${{ needs.setup.outputs.shots }}' | python3 -c "import sys,json; print(' '.join(str(s['id']) for s in json.load(sys.stdin)))")
+          : > shots.txt
+          for id in $IDS; do
+            echo "file 'shots/shot-$id/shot-$id.mp4'" >> shots.txt
+          done
+          # RE-TIME (mandatory, parent decision 2026-11-27): plain -c copy
+          # concat plays slow (~27fps) — the shot files carry stretched
+          # container durations. setpts=N/(30*TB) forces true 30fps from
+          # the frame index; CRF-30 keeps the final under 100MB; -an drops
+          # the shots' silent AAC track (it must never reach the mux).
+          ffmpeg -y -f concat -safe 0 -i shots.txt -vf "setpts=N/(30*TB)" -c:v libx264 -crf 30 -r 30 -pix_fmt yuv420p -an final.mp4
+          ACTUAL=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 final.mp4)
+          echo "Joined frames: $ACTUAL (expected ${{ needs.setup.outputs.total_frames }})"
+          [ "$ACTUAL" = "${{ needs.setup.outputs.total_frames }}" ] || { echo "ERROR: frame count mismatch — expected ${{ needs.setup.outputs.total_frames }}, got $ACTUAL"; exit 1; }
+          # Duration should now read true (re-time forces 30fps): warn if
+          # it is off by more than 2% from nominal — frame count is still
+          # the ground truth, but a wrong duration means the re-time failed.
+          DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 final.mp4)
+          echo "Joined duration: ${DURATION}s (nominal $(( ${{ needs.setup.outputs.total_frames }} / 30 ))s at 30fps)"
+          ls -lh final.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: final.mp4
+          retention-days: 7
+          if-no-files-found: error
+      # Best-effort cleanup of the intermediate shot artifacts. If the
+      # API delete fails, this step still passes — retention-days: 1
+      # expires the shots within 24h regardless.
+      - name: Delete shot artifacts (best effort)
+        continue-on-error: true
+        run: |
+          for id in $(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" --jq '.artifacts[] | select(.name | test("^shot-")) | .id'); do
+            echo "Deleting shot artifact id $id"
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+          done
+          echo "Shot-artifact cleanup attempted (any failure is harmless — retention-days: 1 expires them)."

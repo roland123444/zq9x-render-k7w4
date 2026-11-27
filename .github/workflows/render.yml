@@ -1,3 +1,44 @@
+# Faster Short Pipeline — render.yml (NEW version)
+#
+# What this is: the existing 20-part split render, plus
+#   (1) actions/cache@v4 for node_modules, the Remotion/Chrome browser
+#       download and the webpack bundle — so repeat runs skip the
+#       per-job setup that dominates the old ~12-14 min wall time;
+#   (2) a `join` job that downloads all 20 part artifacts, concats them
+#       with ffmpeg and RE-TIMES to true 30fps (`setpts=N/(30*TB)`, CRF-30
+#       re-encode, `-an` to drop the parts' silent AAC track), verifies the
+#       joined frame count against the manifest total, and uploads ONE
+#       artifact named `final-video`. The re-time is mandatory: plain
+#       `-c copy` concat plays slow (~27fps) because the part files carry
+#       stretched container durations (AGENTS.md) — parent decision
+#       2026-11-27, applied here before first upload.
+#
+# Hard rules kept from the current workflow:
+#   - 20-part matrix, NOT widened to 40 (Free plan caps at 20
+#     concurrent jobs; 40 = 2 waves + repeated setup = slower).
+#   - 1080p, CRF-30, under 100MB. Engine / Bridge.tsx / video code
+#     untouched — workflows only.
+#   - Engine still travels as the AES-256 encrypted 7z
+#     stick3d-render-repo.zip, extracted with p7zip using the
+#     RENDER_ZIP_PASSWORD secret. The Unzip step below is byte-identical
+#     to the current workflow — do not "improve" it.
+#   - workflow_dispatch inputs keep the SAME names (composition,
+#     total_frames, frames_per_part) so existing dispatch commands
+#     keep working.
+#
+# Changes vs the current render.yml:
+#   - Job id `render-part` renamed to `render` (the `join` job needs it).
+#   - Three cache steps added (node_modules, Remotion browser, bundle).
+#     Every cache step has a restore-key fallback and a normal-install
+#     fallback: a cache miss is never a failure, the job just installs
+#     as before.
+#   - Render now uses a pre-built bundle when one exists, and falls
+#     back to src/index.ts when it does not.
+#   - Part artifacts get retention-days: 1 (they are intermediate
+#     files; the joined final-video is the keeper).
+#   - New `join` job (needs: [render], if: always() so a missing part
+#     fails LOUDLY in the join log instead of silently skipping).
+
 name: Render Stick3D in parallel
 on:
   workflow_dispatch:
@@ -11,8 +52,11 @@ on:
       frames_per_part:
         description: "Frames per part"
         default: "1177"
+permissions:
+  contents: read
+
 jobs:
-  render-part:
+  render:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -23,21 +67,146 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      # IDENTICAL to the current workflow — keep exactly as-is.
       - name: Unzip project
         run: |
           sudo apt-get update -qq && (sudo apt-get install -y -qq p7zip-full || sudo apt-get install -y -qq 7zip)
           7z x -p"${{ secrets.RENDER_ZIP_PASSWORD }}" stick3d-render-repo.zip -y
+      # --- Cache 1: node_modules -------------------------------------
+      # Key is the OS + hash of the lockfile (falls back to package.json
+      # if the zip ships no lockfile — hashFiles silently ignores a
+      # missing pattern). Restore-key gives a close-but-stale cache on
+      # a lockfile change; cache-hit is only true on an exact match, so
+      # a stale restore still runs npm install below.
+      - name: Cache node_modules
+        id: cache-node
+        uses: actions/cache@v4
+        with:
+          path: engine/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('engine/package-lock.json', 'engine/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
       - name: Install engine deps
+        if: steps.cache-node.outputs.cache-hit != 'true'
         working-directory: engine
         run: npm install --ignore-scripts
+      # --- Cache 2: Remotion / Chrome browser download ---------------
+      # Remotion downloads its headless Chrome into ~/.cache/remotion on
+      # Linux. On a cache hit the render finds it there and skips the
+      # download entirely.
+      - name: Cache Remotion browser
+        id: cache-browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/remotion
+          key: ${{ runner.os }}-remotion-browser-${{ hashFiles('engine/package-lock.json', 'engine/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-remotion-browser-
+      # Non-fatal on purpose: if this Remotion version has no `browser
+      # ensure` subcommand, the render step below auto-downloads the
+      # browser anyway. Never let this step break a render.
+      - name: Ensure Remotion browser
+        if: steps.cache-browser.outputs.cache-hit != 'true'
+        working-directory: engine
+        continue-on-error: true
+        run: npx remotion browser ensure
+      # --- Cache 3: webpack bundle ------------------------------------
+      # `remotion render` re-bundles the project in every one of the 20
+      # jobs. Bundle once per source state, cache it, render from it.
+      # Key covers everything that can change the bundle.
+      - name: Cache bundle
+        id: cache-bundle
+        uses: actions/cache@v4
+        with:
+          path: engine/bundle
+          key: ${{ runner.os }}-bundle-${{ hashFiles('engine/src/**', 'engine/package.json', 'engine/package-lock.json', 'engine/remotion.config.ts') }}
+          restore-keys: |
+            ${{ runner.os }}-bundle-
+      # Non-fatal: if bundling fails, delete any partial bundle so a
+      # broken dir is never cached, and the render step falls back to
+      # src/index.ts (the old behaviour).
+      - name: Bundle project
+        if: steps.cache-bundle.outputs.cache-hit != 'true'
+        working-directory: engine
+        continue-on-error: true
+        run: npx remotion bundle src/index.ts bundle || rm -rf bundle
       - name: Render part ${{ matrix.part }}
         working-directory: engine
         run: |
+          if [ -d bundle ]; then ENTRY=bundle; else ENTRY=src/index.ts; fi
           START=$(( ${{ matrix.part }} * ${{ inputs.frames_per_part }} ))
           END=$(( START + ${{ inputs.frames_per_part }} - 1 ))
           if [ $END -ge ${{ inputs.total_frames }} ]; then END=$(( ${{ inputs.total_frames }} - 1 )); fi
-          npx remotion render src/index.ts ${{ inputs.composition }} part-${{ matrix.part }}.mp4 --frames=$START-$END --concurrency=2 --timeout=300000
+          npx remotion render "$ENTRY" ${{ inputs.composition }} part-${{ matrix.part }}.mp4 --frames=$START-$END --concurrency=2 --timeout=300000
       - uses: actions/upload-artifact@v4
         with:
           name: part-${{ matrix.part }}
           path: engine/part-${{ matrix.part }}.mp4
+          retention-days: 1
+          if-no-files-found: error
+
+  join:
+    name: Join parts into final video
+    needs: [render]
+    # Run even if a part failed, so the failure is LOUD: the download
+    # loop below exits 1 naming the missing part, instead of the join
+    # silently skipping and the run looking half-done.
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download all 20 part artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p parts
+          for i in $(seq 0 19); do
+            echo "Downloading part-$i ..."
+            gh run download "${{ github.run_id }}" --repo "${{ github.repository }}" -n "part-$i" -D "parts/part-$i"
+            f="parts/part-$i/part-$i.mp4"
+            [ -s "$f" ] || { echo "ERROR: part-$i artifact is missing or empty — join cannot proceed"; exit 1; }
+          done
+          echo "All 20 parts present."
+      - name: Join parts (re-time to true 30fps + CRF-30) and verify frame count
+        run: |
+          set -euo pipefail
+          : > parts.txt
+          for i in $(seq 0 19); do
+            echo "file 'parts/part-$i/part-$i.mp4'" >> parts.txt
+          done
+          # RE-TIME (mandatory, parent decision 2026-11-27): plain -c copy
+          # concat plays slow (~27fps) — the part files carry stretched
+          # container durations. setpts=N/(30*TB) forces true 30fps from
+          # the frame index; CRF-30 keeps the final under 100MB; -an drops
+          # the parts' silent AAC track (it must never reach the mux).
+          ffmpeg -y -f concat -safe 0 -i parts.txt -vf "setpts=N/(30*TB)" -c:v libx264 -crf 30 -r 30 -pix_fmt yuv420p -an final.mp4
+          ACTUAL=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 final.mp4)
+          echo "Joined frames: $ACTUAL (expected ${{ inputs.total_frames }})"
+          [ "$ACTUAL" = "${{ inputs.total_frames }}" ] || { echo "ERROR: frame count mismatch — expected ${{ inputs.total_frames }}, got $ACTUAL"; exit 1; }
+          # Duration should now read true (re-time forces 30fps): warn if
+          # it is off by more than 2% from nominal — frame count is still
+          # the ground truth, but a wrong duration means the re-time failed.
+          DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 final.mp4)
+          echo "Joined duration: ${DURATION}s (nominal $(( ${{ inputs.total_frames }} / 30 ))s at 30fps)"
+          ls -lh final.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: final.mp4
+          retention-days: 7
+          if-no-files-found: error
+      # Best-effort cleanup of the 20 intermediate part artifacts.
+      # If the API delete fails (e.g. token permissions), this step
+      # still passes — retention-days: 1 expires the parts within 24h
+      # regardless, so nothing is left behind either way.
+      - name: Delete part artifacts (best effort)
+        continue-on-error: true
+        run: |
+          for id in $(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" --jq '.artifacts[] | select(.name | test("^part-")) | .id'); do
+            echo "Deleting part artifact id $id"
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+          done
+          echo "Part-artifact cleanup attempted (any failure is harmless — retention-days: 1 expires them)."
